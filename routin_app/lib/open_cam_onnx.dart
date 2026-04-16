@@ -1,9 +1,9 @@
+
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:onnxruntime/onnxruntime.dart';
 import 'package:flutter/services.dart';
 import 'dart:typed_data';
-import 'dart:math' as math;
 import 'package:image/image.dart' as img;
 
 class OpenCam extends StatefulWidget {
@@ -15,6 +15,7 @@ class OpenCam extends StatefulWidget {
 
 class OpenCamState extends State<OpenCam> {
   CameraController? cameraController;
+  CameraImage? imgCamera;
   int frameCount = 0;
   List<String> labels = [];
 
@@ -48,7 +49,8 @@ class OpenCamState extends State<OpenCam> {
       frameCount++;
       // Her 20 framede bir çalıştır - dengeli
       if (!isWorking && frameCount % 20 == 0) {
-        runModelOnStreamFrame(image);
+        imgCamera = image;
+        runModelOnStreamFrame();
       }
     });
   }
@@ -86,15 +88,8 @@ class OpenCamState extends State<OpenCam> {
     }
   }
 
-  double normalize(double v) {
-    if (v < 0 || v > 1) {
-      return 1 / (1 + math.exp(-v));
-    }
-    return v;
-  }
-
-  Future<void> runModelOnStreamFrame(CameraImage cameraImage) async {
-    if (session == null) return;
+  Future<void> runModelOnStreamFrame() async {
+    if (imgCamera == null || session == null) return;
 
     // FPS Dengeleyici (Buffer/Throttle): Yeni bir kareyi girmeden nce araya bekleme payı koy(Maks saniyede ~2-3 kare işler)
     int currentTime = DateTime.now().millisecondsSinceEpoch;
@@ -106,13 +101,9 @@ class OpenCamState extends State<OpenCam> {
     isWorking = true;
     lastProcessingTime = currentTime;
 
-    OrtValueTensor? inputOrt;
-    OrtRunOptions? runOptions;
-    List<OrtValue?>? outputs;
-
     try {
       // YUV420 veya BGRA8888 -> RGB dnşm
-      img.Image? image = convertYUV420ToImage(cameraImage);
+      img.Image? image = convertYUV420ToImage(imgCamera!);
 
       if (image == null) {
         print("Grnt dnştrme başarısız");
@@ -153,15 +144,15 @@ class OpenCamState extends State<OpenCam> {
       print("Input hazır: ${inputData.length} değer");
 
       // ONNX input tensor oluştur
-      inputOrt = OrtValueTensor.createTensorWithDataList(
+      final inputOrt = OrtValueTensor.createTensorWithDataList(
         inputData,
         [1, 3, 640, 640],
       );
 
       // Inference çalıştır
       final inputs = {'images': inputOrt};
-      runOptions = OrtRunOptions();
-      outputs = session!.run(runOptions, inputs);
+      final runOptions = OrtRunOptions();
+      final outputs = session!.run(runOptions, inputs);
 
       print("Inference tamamlandı");
 
@@ -179,15 +170,12 @@ class OpenCamState extends State<OpenCam> {
           int totalDetections = 0;
           int highConfidenceCount = 0;
 
-          double bestFinalConfidence = 0.0;
-          String bestDetectedClass = "";
-
           // YOLOv5 output: [1, 25200, 9] formatı
           // 9 = 4 (bbox) + 1 (confidence) + 4 (classes: D00, D10, D20, D40)
 
           for (var detection in outputData[0]) {
             // Confidence score
-            double confidence = normalize(detection[4]);
+            double confidence = detection[4];
 
             totalDetections++;
 
@@ -207,7 +195,7 @@ class OpenCamState extends State<OpenCam> {
               double h = detection[3];
 
               // Class skorları (index 5'ten sonra) - 4 class var
-              List<double> classScores = detection.sublist(5).map((v) => normalize(v)).toList();
+              List<double> classScores = detection.sublist(5);
               int maxIndex = 0;
               double maxScore = classScores[0];
 
@@ -230,20 +218,18 @@ class OpenCamState extends State<OpenCam> {
               print("   Final: ${(finalConfidence * 100).toStringAsFixed(1)}%");
               print("   Bbox: x=$x, y=$y, w=$w, h=$h");
 
-              // En yüksek confidence olanı sakla
-              if (finalConfidence > 0.25 && finalConfidence > bestFinalConfidence) {
-                bestFinalConfidence = finalConfidence;
-                bestDetectedClass = detectedClass;
+              // Final confidence ile karar ver
+              if (finalConfidence > 0.25) {
+                potHoleDetected = true;
+
+                setState(() {
+                  result =
+                      "⚠️ Yol Hasarı: $detectedClass\nGüven: ${(finalConfidence * 100).toStringAsFixed(1)}%";
+                });
+
+                break;
               }
             }
-          }
-
-          if (bestFinalConfidence > 0.25) {
-            potHoleDetected = true;
-            setState(() {
-              result =
-                  "⚠️ Yol Hasarı: $bestDetectedClass\nGüven: ${(bestFinalConfidence * 100).toStringAsFixed(1)}%";
-            });
           }
 
           print(
@@ -256,18 +242,17 @@ class OpenCamState extends State<OpenCam> {
           }
         }
       }
+
+      inputOrt.release();
+      runOptions.release();
+      for (final output in outputs) {
+        output?.release();
+      }
     } catch (e) {
       print("Model çalıştırma hatası: $e");
-    } finally {
-      inputOrt?.release();
-      runOptions?.release();
-      if (outputs != null) {
-        for (final output in outputs) {
-          output?.release();
-        }
-      }
-      isWorking = false;
     }
+
+    isWorking = false;
   }
 
   img.Image? convertYUV420ToImage(CameraImage cameraImage) {
@@ -282,8 +267,8 @@ class OpenCamState extends State<OpenCam> {
 
       for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
-          final int uvIndex =
-              (uvPixelStride ?? 1) * (x ~/ 2) + uvRowStride * (y ~/ 2);
+          final int uvIndex = uvPixelStride ??
+              1 * (x / 2).floor() + uvRowStride * (y / 2).floor();
           final int index = y * width + x;
 
           final yp = cameraImage.planes[0].bytes[index];
@@ -309,14 +294,11 @@ class OpenCamState extends State<OpenCam> {
 
   @override
   void dispose() {
-    if (cameraController != null) {
-      if (cameraController!.value.isStreamingImages) {
-        cameraController!.stopImageStream();
-      }
+    super.dispose();
+    if (cameraController != null && cameraController!.value.isInitialized) {
       cameraController!.dispose();
     }
     session?.release();
-    super.dispose();
   }
 
   @override
@@ -407,7 +389,9 @@ class OpenCamState extends State<OpenCam> {
                           cameraController!.startImageStream((image) {
                             frameCount++;
                             if (!isWorking && frameCount % 20 == 0) {
-                              runModelOnStreamFrame(image);
+                              // 30 frame
+                              imgCamera = image;
+                              runModelOnStreamFrame();
                             }
                           });
                         }

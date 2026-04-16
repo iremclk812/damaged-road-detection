@@ -33,6 +33,13 @@ class OpenCamState extends State<OpenCam> {
   double currentSpeedKmh = 0.0;
   String locationStatus = "Konum aranıyor...";
 
+  // --- Bounding Box Verileri ---
+  double? boxX;
+  double? boxY;
+  double? boxW;
+  double? boxH;
+  String? boxLabel;
+
   @override
   void initState() {
     super.initState();
@@ -331,6 +338,13 @@ class OpenCamState extends State<OpenCam> {
                 setState(() {
                   result =
                       "⚠️ Yol Hasarı: $detectedClass\nGüven: ${(finalConfidence * 100).toStringAsFixed(1)}%\n\n$posText";
+
+                  // Bounding box için değişkenleri kaydet
+                  boxX = x;
+                  boxY = y;
+                  boxW = w;
+                  boxH = h;
+                  boxLabel = "$detectedClass (Hata Oranı: ${(finalConfidence * 100).toStringAsFixed(1)}%)";
                 });
 
                 break;
@@ -344,6 +358,11 @@ class OpenCamState extends State<OpenCam> {
           if (!potHoleDetected) {
             setState(() {
               result = "";
+              boxX = null;
+              boxY = null;
+              boxW = null;
+              boxH = null;
+              boxLabel = null;
             });
           }
         }
@@ -421,7 +440,7 @@ class OpenCamState extends State<OpenCam> {
                     icon: Container(
                       padding: const EdgeInsets.all(8),
                       decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.5),
+                        color: Colors.black.withValues(alpha: 0.5),
                         shape: BoxShape.circle,
                       ),
                       child: const Icon(
@@ -432,6 +451,51 @@ class OpenCamState extends State<OpenCam> {
                     ),
                   ),
                 ),
+
+                // BOUNDING BOX ÇİZİMİ
+                if (result.isNotEmpty && boxX != null && boxY != null && boxW != null && boxH != null)
+                  Builder(
+                    builder: (context) {
+                      double screenW = MediaQuery.of(context).size.width;
+                      double screenH = MediaQuery.of(context).size.height;
+
+                      // Çıktı normalize mi (0 - 1 arası) yoksa direkt piksel mi (0 - 640) kontrolü (YOLO versiyonuna göre değişir)
+                      double rX = boxX! > 2.0 ? boxX! / 640.0 : boxX!;
+                      double rY = boxY! > 2.0 ? boxY! / 640.0 : boxY!;
+                      double rW = boxW! > 2.0 ? boxW! / 640.0 : boxW!;
+                      double rH = boxH! > 2.0 ? boxH! / 640.0 : boxH!;
+
+                      // Kameraya orantıla ve limitleri (clamp) belirle ki Flutter hata verip gizlemesin
+                      double finalWidth = (rW * screenW).clamp(20.0, screenW);
+                      double finalHeight = (rH * screenH).clamp(20.0, screenH);
+                      double finalLeft = (rX * screenW) - (finalWidth / 2);
+                      double finalTop = (rY * screenH) - (finalHeight / 2);
+
+                      return Positioned(
+                        left: finalLeft,
+                        top: finalTop,
+                        width: finalWidth,
+                        height: finalHeight,
+                        child: Container(
+                          decoration: BoxDecoration(
+                            border: Border.all(color: Colors.redAccent, width: 4.0),
+                            borderRadius: BorderRadius.circular(8.0),
+                          ),
+                          child: Align(
+                            alignment: Alignment.topLeft,
+                            child: Container(
+                              color: Colors.redAccent,
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                              child: Text(
+                                boxLabel ?? "",
+                                style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
 
                 // Kamera değiştir butonu
                 Positioned(

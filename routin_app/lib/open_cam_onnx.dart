@@ -7,7 +7,9 @@ import 'dart:typed_data';
 import 'package:image/image.dart' as img;
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart' as ll;
+import 'package:sensors_plus/sensors_plus.dart';
 import 'dart:async';
+import 'dart:math' as math;
 
 class OpenCam extends StatefulWidget {
   const OpenCam({super.key});
@@ -27,11 +29,25 @@ class OpenCamState extends State<OpenCam> {
   OrtSession? session;
   int lastProcessingTime = 0; // Buffer/throttle iin son işlenme zamanı
 
+  // --- SEYAHAT VE TESPİT BUFFER'I ---
+  DateTime sessionStartTime = DateTime.now();
+  List<Map<String, dynamic>> detectionBuffer = []; // Tüm tespitlerin tutulduğu log buffer'ı
+  double cameraCalibrationFactor = 1200.0; // Kamera açısı ve yüksekliği için kalibrasyon katsayısı
+
   // --- GPS LOCATOR VERİLERİ ---
   Position? currentPosition;
   StreamSubscription<Position>? positionStream;
   double currentSpeedKmh = 0.0;
   String locationStatus = "Searching location...";
+
+  // --- SENSÖR (İVMEÖLÇER/TİTREŞİM) VERİLERİ ---
+  StreamSubscription<UserAccelerometerEvent>? accelStream;
+  List<Map<String, dynamic>> bumpBuffer = []; // Fiziksel olarak hissedilen çukurlar/sarsıntılar
+  double lastVibrationMagnitude = 0.0;
+  // Eşiği ayarlayabilirsiniz (m/s^2 cinsinden ani ivme değişimi)
+  // Telefon elde tutulurken veya araç normal seyrindeyken ufak sarsıntılar üretebilir.
+  // Gerçek bir çukur hissi (anormal sarsıntı) için eşik değerini 6'dan 15'e çıkarıyoruz.
+  final double bumpThreshold = 15.0;
 
   // --- Bounding Box Verileri ---
   double? boxX;
@@ -47,6 +63,50 @@ class OpenCamState extends State<OpenCam> {
     initCamera();
     // GPS başlat
     _initLocation();
+    // Sensör başlat
+    _initSensors();
+  }
+
+  void _initSensors() {
+    // Sadece yerçekimi HARİÇ ivmeyi (kullanıcı/araç hareketi) dinler.
+    accelStream = userAccelerometerEventStream().listen((UserAccelerometerEvent event) {
+      if (mounted) {
+        // x, y, z vektörlerinin bileşkesini (magnitude) alıyoruz
+        double magnitude = math.sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
+
+        lastVibrationMagnitude = magnitude;
+
+        // Anormal bir sarsıntı (çukur) tespit edildiğinde:
+        if (magnitude > bumpThreshold && currentPosition != null) {
+          _recordPhysicalBump(magnitude);
+        }
+      }
+    });
+  }
+
+  void _recordPhysicalBump(double magnitude) {
+    if (currentPosition == null) return;
+
+    // Aynı saniyede peş peşe 10 tane ivme verisi girmesin diye son eklenenle zaman farkına bakıyoruz
+    if (bumpBuffer.isNotEmpty) {
+      final lastTime = bumpBuffer.last['time'] as DateTime;
+      if (DateTime.now().difference(lastTime).inMilliseconds < 1000) {
+        return; // Aynı sarsıntının kuyruğu, yoksay
+      }
+    }
+
+    // Sarsıntı olarak Buffer'da tut
+    bumpBuffer.add({
+      'time': DateTime.now(),
+      'latitude': currentPosition!.latitude,
+      'longitude': currentPosition!.longitude,
+      'magnitude': magnitude,
+    });
+
+    // Buffer'ı temiz tut (son 20 sarsıntıyı tut)
+    if (bumpBuffer.length > 20) {
+      bumpBuffer.removeAt(0);
+    }
   }
 
   Future<void> _initLocation() async {
@@ -274,6 +334,7 @@ class OpenCamState extends State<OpenCam> {
               // ====== YENİ: UZAKLIK VE GERÇEK KOORDİNAT HESABI ======
               double distanceToDefect = 0.0;
               ll.LatLng? defectRealLocation;
+              bool isCorrelatedWithSensor = false;
 
               if (currentPosition != null) {
                 // 'y' kutunun merkezi, 'h' yüksekliğidir.
@@ -289,7 +350,7 @@ class OpenCamState extends State<OpenCam> {
                 if (bottomY > 320) {
                   // Basit Kalibrasyon Katsayısı: Bu katsayı aracın kamera yüksekliği ve açısına göre ayarlanabilir.
                   // Matematik: Uzaklık = Katsayı / (bottomY - UfukÇizgisiY)
-                  distanceToDefect = 1200 / (bottomY - 320);
+                  distanceToDefect = cameraCalibrationFactor / (bottomY - 320);
                 } else {
                   // Y ekseninde çukur ufuk çizgisinin yukarısında bulunamaz. Bulunduysa model hatalı veya uzağı seçmiştir.
                   distanceToDefect = 50.0; // Max mesafe varsayıyoruz.
@@ -313,6 +374,33 @@ class OpenCamState extends State<OpenCam> {
 
                 // Araç konumundan, pusula yönüne doğru 'adjustedDistance' kadar ilerle ve o noktanın koordinatını ver!
                 defectRealLocation = distanceTool.offset(myVehicleLocation, adjustedDistance, currentPosition!.heading);
+
+                // =======================================================
+                // ====== 4. SENSÖR (FİZİKSEL SARSINTI) KORELASYONU ======
+                // Modelimizin görsel olarak bulduğu çukur ile, aracın o sırada veya saniyeler önce girdiği çukur uyuşuyor mu?
+
+                // Aracın şimdiki veya 1-2 saniye içindeki konumlarına (buffer'a) bak
+                for (var bump in bumpBuffer) {
+                  ll.LatLng bumpLocation = ll.LatLng(bump['latitude'], bump['longitude']);
+                  double distanceBetweenBumpAndVisual = distanceTool.as(
+                    ll.LengthUnit.Meter,
+                    bumpLocation,
+                    defectRealLocation!
+                  );
+
+                  // Eğer fiziksel sarsıntı yeri ile kameranın gördüğü çukur bölgesi 15 metre çapındaysa (çok yakınlar)
+                  if (distanceBetweenBumpAndVisual < 15.0) {
+                    isCorrelatedWithSensor = true;
+                    // Güven puanına +%20 bonus ver
+                    finalConfidence = (finalConfidence + 0.20).clamp(0.0, 1.0);
+                    break;
+                  }
+                }
+
+                // Çıktıya sensör desteği metnini ekleyelim
+                if (isCorrelatedWithSensor) {
+                    detectedClass += " (SENSOR CONFIRMED 🚨)";
+                }
               }
               // ========================================================
 
@@ -325,6 +413,21 @@ class OpenCamState extends State<OpenCam> {
               // Final confidence ile karar ver
               if (finalConfidence > 0.25) {
                 potHoleDetected = true;
+
+                Duration travelTime = DateTime.now().difference(sessionStartTime);
+
+                // Hatayı ana detectionBuffer'a (hız, seyahat süresi, koordinatlar ile) kaydet
+                detectionBuffer.add({
+                  'timestamp': DateTime.now(),
+                  'travelTime': travelTime.toString(),
+                  'defectType': detectedClass,
+                  'confidence': finalConfidence,
+                  'vehicleLocation': currentPosition != null ? '${currentPosition!.latitude}, ${currentPosition!.longitude}' : 'Unknown',
+                  'defectLocation': defectRealLocation != null ? '${defectRealLocation.latitude}, ${defectRealLocation.longitude}' : 'Unknown',
+                  'speedKmh': currentSpeedKmh,
+                  'distanceToDefect': distanceToDefect,
+                  'isSensorConfirmed': isCorrelatedWithSensor,
+                });
 
                 // Konum ve hız verilerini ekrana (şimdilik string olarak) bas
                 String posText = "No Location/Speed data";
@@ -383,6 +486,7 @@ class OpenCamState extends State<OpenCam> {
 
   @override
   void dispose() {
+    accelStream?.cancel();
     positionStream?.cancel();
     if (cameraController != null && cameraController!.value.isInitialized) {
       cameraController!.dispose();

@@ -43,6 +43,7 @@ dependencies:
   ffi: ^2.1.0
   geolocator: ^14.0.2
   latlong2: ^0.9.1
+  sensors_plus: ^7.0.0
 dev_dependencies:
   flutter_test:
     sdk: flutter

@@ -478,17 +478,30 @@ class OpenCamState extends State<OpenCam> {
                         height: finalHeight,
                         child: Container(
                           decoration: BoxDecoration(
-                            border: Border.all(color: Colors.redAccent, width: 4.0),
-                            borderRadius: BorderRadius.circular(8.0),
+                            border: Border.all(color: Colors.greenAccent, width: 3.0),
+                            borderRadius: BorderRadius.circular(12.0),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.greenAccent.withValues(alpha: 0.3),
+                                blurRadius: 10.0,
+                                spreadRadius: 2.0,
+                              ),
+                            ],
                           ),
                           child: Align(
                             alignment: Alignment.topLeft,
                             child: Container(
-                              color: Colors.redAccent,
+                              decoration: BoxDecoration(
+                                color: Colors.greenAccent.withValues(alpha: 0.8),
+                                borderRadius: const BorderRadius.only(
+                                  topLeft: Radius.circular(8.0),
+                                  bottomRight: Radius.circular(8.0),
+                                ),
+                              ),
                               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
                               child: Text(
                                 boxLabel ?? "",
-                                style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+                                style: const TextStyle(color: Colors.black87, fontSize: 14, fontWeight: FontWeight.bold),
                               ),
                             ),
                           ),

@@ -1,6 +1,6 @@
-
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:onnxruntime/onnxruntime.dart';
 import 'package:flutter/services.dart';
 import 'dart:typed_data';
@@ -46,9 +46,9 @@ class OpenCamState extends State<OpenCam> {
 
     // Stream başlat
     cameraController!.startImageStream((image) {
-      frameCount++;
-      // Her 20 framede bir çalıştır - dengeli
-      if (!isWorking && frameCount % 20 == 0) {
+      int currentTime = DateTime.now().millisecondsSinceEpoch;
+      // Her 5 saniyede bir frame al
+      if (!isWorking && (currentTime - lastProcessingTime >= 5000)) {
         imgCamera = image;
         runModelOnStreamFrame();
       }
@@ -102,44 +102,32 @@ class OpenCamState extends State<OpenCam> {
     lastProcessingTime = currentTime;
 
     try {
-      // YUV420 veya BGRA8888 -> RGB dnşm
-      img.Image? image = convertYUV420ToImage(imgCamera!);
+      // Isolate için veriyi Map haline getiriyoruz (CameraImage kopyalanamaz, sadece verilerini aktarabiliriz)
+      // ÖNEMLİ: BufferQueueProducer Timeout hatasını önlemek için Native referansı hemen kopyalayarak serbest bırakıyoruz!
+      final List<Map<String, dynamic>> planeData = imgCamera!.planes.map((plane) {
+        return {
+          'bytes': Uint8List.fromList(plane.bytes), // Hard Copy yapılarak native bellek kilidi kaldırılır
+          'bytesPerRow': plane.bytesPerRow,
+          'bytesPerPixel': plane.bytesPerPixel,
+        };
+      }).toList();
 
-      if (image == null) {
-        print("Grnt dnştrme başarısız");
+      final Map<String, dynamic> isolateParams = {
+        'width': imgCamera!.width,
+        'height': imgCamera!.height,
+        'planes': planeData,
+      };
+
+      // Ağır işlemleri (YUV->RGB Dönüşümü, Döndürme, Yeniden Boyutlandırma, Float32List oluşturma)
+      // başka bir Thread'de (Isolate'te) bilgisayarı dondurmadan yapıyoruz!
+      final Float32List? inputData = await compute(_processCameraImageInIsolate, isolateParams);
+
+      if (inputData == null) {
+        print("Görüntü dönüştürme başarısız (Isolate Hatası)");
         isWorking = false;
         return;
       }
 
-      print("Grnt boyutu (Orijinal): ${image.width}x${image.height}");
-
-      // 1. Android kamera sensr genellikle yana yatıktır (Landscape).
-      // Ekranımız Portrait ise 90 derece dndrmemiz gerekebilir.
-      img.Image rotatedImage = img.copyRotate(image, angle: 90);
-
-      // 2. 640x640'a resize et - MODEL BU BOYUTU BEKLİYOR
-      img.Image resizedImage = img.copyResize(rotatedImage, width: 640, height: 640);
-
-      // Normalize edilmiş Float32List oluştur [1, 3, 640, 640] - CHW formatı
-      var inputData = Float32List(1 * 3 * 640 * 640);
-      int pixelIndex = 0;
-
-      for (int c = 0; c < 3; c++) {
-        for (int y = 0; y < 640; y++) {
-          for (int x = 0; x < 640; x++) {
-            final pixel = resizedImage.getPixel(x, y);
-            double value;
-            if (c == 0)
-              value = pixel.r / 255.0; // R
-            else if (c == 1)
-              value = pixel.g / 255.0; // G
-            else
-              value = pixel.b / 255.0; // B
-
-            inputData[pixelIndex++] = value;
-          }
-        }
-      }
 
       print("Input hazır: ${inputData.length} değer");
 
@@ -255,42 +243,6 @@ class OpenCamState extends State<OpenCam> {
     isWorking = false;
   }
 
-  img.Image? convertYUV420ToImage(CameraImage cameraImage) {
-    try {
-      final int width = cameraImage.width;
-      final int height = cameraImage.height;
-
-      final img.Image image = img.Image(width: width, height: height);
-
-      final int uvRowStride = cameraImage.planes[1].bytesPerRow;
-      final int? uvPixelStride = cameraImage.planes[1].bytesPerPixel;
-
-      for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-          final int uvIndex = uvPixelStride ??
-              1 * (x / 2).floor() + uvRowStride * (y / 2).floor();
-          final int index = y * width + x;
-
-          final yp = cameraImage.planes[0].bytes[index];
-          final up = cameraImage.planes[1].bytes[uvIndex];
-          final vp = cameraImage.planes[2].bytes[uvIndex];
-
-          int r = (yp + vp * 1436 / 1024 - 179).round().clamp(0, 255);
-          int g = (yp - up * 46549 / 131072 + 44 - vp * 93604 / 131072 + 91)
-              .round()
-              .clamp(0, 255);
-          int b = (yp + up * 1814 / 1024 - 227).round().clamp(0, 255);
-
-          image.setPixelRgb(x, y, r, g, b);
-        }
-      }
-
-      return image;
-    } catch (e) {
-      print("Görüntü dönüştürme hatası: $e");
-      return null;
-    }
-  }
 
   @override
   void dispose() {
@@ -387,9 +339,8 @@ class OpenCamState extends State<OpenCam> {
                           setState(() {});
 
                           cameraController!.startImageStream((image) {
-                            frameCount++;
-                            if (!isWorking && frameCount % 20 == 0) {
-                              // 30 frame
+                            int currentTime = DateTime.now().millisecondsSinceEpoch;
+                            if (!isWorking && (currentTime - lastProcessingTime >= 5000)) {
                               imgCamera = image;
                               runModelOnStreamFrame();
                             }
@@ -421,11 +372,11 @@ class OpenCamState extends State<OpenCam> {
                     child: Container(
                       padding: const EdgeInsets.all(20),
                       decoration: BoxDecoration(
-                        color: Colors.red.withOpacity(0.9),
+                        color: Colors.red.withValues(alpha: 0.9),
                         borderRadius: BorderRadius.circular(15),
                         boxShadow: [
                           BoxShadow(
-                            color: Colors.black.withOpacity(0.3),
+                            color: Colors.black.withValues(alpha: 0.3),
                             blurRadius: 10,
                             spreadRadius: 2,
                           ),
@@ -458,3 +409,74 @@ class OpenCamState extends State<OpenCam> {
     );
   }
 }
+
+// === ISOLATE (ARKA PLAN THREAD) İÇİN TOP-LEVEL FONKSİYON ===
+// Görüntünün işlenmesi 1 milyondan fazla piksel döndürdüğü için arayüzü dondurmasın diye burada çalışır.
+Future<Float32List?> _processCameraImageInIsolate(Map<String, dynamic> params) async {
+  try {
+    final int width = params['width'];
+    final int height = params['height'];
+    final List<Map<String, dynamic>> planes = params['planes'];
+
+    final img.Image image = img.Image(width: width, height: height);
+
+    final Uint8List yPlane = planes[0]['bytes'];
+    final Uint8List uPlane = planes[1]['bytes'];
+    final Uint8List vPlane = planes[2]['bytes'];
+
+    final int uvRowStride = planes[1]['bytesPerRow'];
+    final int? uvPixelStride = planes[1]['bytesPerPixel'];
+
+    for (int y = 0; y < height; y++) {
+      for (int x = 0; x < width; x++) {
+        // Eski çalışan orijinal matematik formülüne dönüş yapıldı
+        final int uvIndex = uvPixelStride ??
+            1 * (x / 2).floor() + uvRowStride * (y / 2).floor();
+        final int index = y * width + x;
+
+        final yp = yPlane[index];
+        final up = uPlane[uvIndex];
+        final vp = vPlane[uvIndex];
+
+        int r = (yp + vp * 1436 / 1024 - 179).round().clamp(0, 255);
+        int g = (yp - up * 46549 / 131072 + 44 - vp * 93604 / 131072 + 91).round().clamp(0, 255);
+        int b = (yp + up * 1814 / 1024 - 227).round().clamp(0, 255);
+
+        image.setPixelRgb(x, y, r, g, b);
+      }
+    }
+
+    // 1. Android kamerası veriyi yana yatık (landscape) verir, düzeltiyoruz.
+    img.Image rotatedImage = img.copyRotate(image, angle: 90);
+
+    // 2. Modeli (YOLO v5) beslemek için 640x640'a boyutlandırıyoruz.
+    img.Image resizedImage = img.copyResize(rotatedImage, width: 640, height: 640);
+
+    // 3. Modeli beslemek için 1D listeye (Float32List - [1, 3, 640, 640]) çeviriyoruz.
+    var inputData = Float32List(1 * 3 * 640 * 640);
+    int pixelIndex = 0;
+
+    for (int c = 0; c < 3; c++) {
+      for (int y = 0; y < 640; y++) {
+        for (int x = 0; x < 640; x++) {
+          final pixel = resizedImage.getPixel(x, y);
+          double value;
+          if (c == 0)
+            value = pixel.r / 255.0; // R
+          else if (c == 1)
+            value = pixel.g / 255.0; // G
+          else
+            value = pixel.b / 255.0; // B
+
+          inputData[pixelIndex++] = value;
+        }
+      }
+    }
+
+    return inputData;
+  } catch (e) {
+    print("Isolate İçinde Kritik Hata: $e");
+    return null;
+  }
+}
+

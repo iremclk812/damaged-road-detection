@@ -31,7 +31,7 @@ class OpenCamState extends State<OpenCam> {
   Position? currentPosition;
   StreamSubscription<Position>? positionStream;
   double currentSpeedKmh = 0.0;
-  String locationStatus = "Konum aranıyor...";
+  String locationStatus = "Searching location...";
 
   // --- Bounding Box Verileri ---
   double? boxX;
@@ -57,7 +57,7 @@ class OpenCamState extends State<OpenCam> {
     serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
       setState(() {
-        locationStatus = "Konum servisi kapalı.";
+        locationStatus = "Location service is disabled.";
       });
       return;
     }
@@ -67,7 +67,7 @@ class OpenCamState extends State<OpenCam> {
       permission = await Geolocator.requestPermission();
       if (permission == LocationPermission.denied) {
         setState(() {
-          locationStatus = "Konum izni reddedildi.";
+          locationStatus = "Location permission denied.";
         });
         return;
       }
@@ -75,13 +75,13 @@ class OpenCamState extends State<OpenCam> {
 
     if (permission == LocationPermission.deniedForever) {
       setState(() {
-        locationStatus = "Konum izni kalıcı reddedildi.";
+        locationStatus = "Location permission permanently denied.";
       });
       return;
     }
 
     setState(() {
-      locationStatus = "Konum bulunuyor...";
+      locationStatus = "Locating...";
     });
 
     // Anlık konum akışı başlat, çok hassas veri gerek - Otonom araç gibi
@@ -96,7 +96,7 @@ class OpenCamState extends State<OpenCam> {
           currentPosition = position;
           // Geolocator hızı m/s (metre/saniye) cinsinden verir, biz km/h yapıyoruz (* 3.6)
           currentSpeedKmh = (position.speed * 3.6);
-          locationStatus = "GPS Aktif";
+          locationStatus = "GPS Active";
         });
       }
     });
@@ -269,7 +269,7 @@ class OpenCamState extends State<OpenCam> {
               double finalConfidence = confidence * maxScore;
 
               String detectedClass =
-                  maxIndex < labels.length ? labels[maxIndex] : "Bilinmeyen";
+                  maxIndex < labels.length ? labels[maxIndex] : "Unknown";
 
               // ====== YENİ: UZAKLIK VE GERÇEK KOORDİNAT HESABI ======
               double distanceToDefect = 0.0;
@@ -327,24 +327,24 @@ class OpenCamState extends State<OpenCam> {
                 potHoleDetected = true;
 
                 // Konum ve hız verilerini ekrana (şimdilik string olarak) bas
-                String posText = "Konum/Hız bilgisi yok";
+                String posText = "No Location/Speed data";
                 if (currentPosition != null && defectRealLocation != null) {
-                   posText = "Araç Konumu: ${currentPosition!.latitude.toStringAsFixed(5)}, ${currentPosition!.longitude.toStringAsFixed(5)}\n"
-                             "Hız: ${currentSpeedKmh.toStringAsFixed(1)} km/h\n"
-                             "Çukura Uzaklık: ${distanceToDefect.toStringAsFixed(1)} m\n\n"
-                             "📍 Çukurun GERÇEK Konumu:\n${defectRealLocation.latitude.toStringAsFixed(5)}, ${defectRealLocation.longitude.toStringAsFixed(5)}";
+                   posText = "Vehicle Location: ${currentPosition!.latitude.toStringAsFixed(5)}, ${currentPosition!.longitude.toStringAsFixed(5)}\n"
+                             "Speed: ${currentSpeedKmh.toStringAsFixed(1)} km/h\n"
+                             "Distance to Defect: ${distanceToDefect.toStringAsFixed(1)} m\n\n"
+                             "📍 EXACT Defect Location:\n${defectRealLocation.latitude.toStringAsFixed(5)}, ${defectRealLocation.longitude.toStringAsFixed(5)}";
                 }
 
                 setState(() {
                   result =
-                      "⚠️ Yol Hasarı: $detectedClass\nGüven: ${(finalConfidence * 100).toStringAsFixed(1)}%\n\n$posText";
+                      "⚠️ Road Damage: $detectedClass\nConfidence: ${(finalConfidence * 100).toStringAsFixed(1)}%\n\n$posText";
 
                   // Bounding box için değişkenleri kaydet
                   boxX = x;
                   boxY = y;
                   boxW = w;
                   boxH = h;
-                  boxLabel = "$detectedClass (Hata Oranı: ${(finalConfidence * 100).toStringAsFixed(1)}%)";
+                  boxLabel = "$detectedClass (Confidence: ${(finalConfidence * 100).toStringAsFixed(1)}%)";
                 });
 
                 break;
@@ -410,7 +410,7 @@ class OpenCamState extends State<OpenCam> {
                     onPressed: () {
                       initCamera();
                     },
-                    child: const Text('Kamerayı Aç'),
+                    child: const Text('Open Camera'),
                   ),
                 ],
               ),
@@ -607,7 +607,7 @@ class OpenCamState extends State<OpenCam> {
 }
 
 // === ISOLATE (ARKA PLAN THREAD) İÇİN TOP-LEVEL FONKSİYON ===
-// Görüntünün işlenmesi 1 milyondan fazla piksel döndürdüğü için arayüzü dondurmasın diye burada çalışır.
+// Görüntünün işlenmesi 1 milyondan fazla piksel döndürdüğü için arayüzü dondurmadan burada çalışır.
 Future<Float32List?> _processCameraImageInIsolate(Map<String, dynamic> params) async {
   try {
     final int width = params['width'];
@@ -675,4 +675,3 @@ Future<Float32List?> _processCameraImageInIsolate(Map<String, dynamic> params) a
     return null;
   }
 }
-

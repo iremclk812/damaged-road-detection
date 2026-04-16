@@ -1,13 +1,16 @@
 import torch
 import sys
 
+# YOLOv5 klasörünü ekle
+sys.path.insert(0, './yolov5')
+
 print("Model kontrol ediliyor...")
 model_path = "yolov5/weights/IMSC/last_95.pt"
 
 try:
     # Model yükle
-    checkpoint = torch.load(model_path, map_location='cpu')
-    
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+
     print("\n=== Model Bilgileri ===")
     print(f"Model anahtarları: {list(checkpoint.keys())}")
     

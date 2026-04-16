@@ -93,8 +93,8 @@ class OpenCamState extends State<OpenCam> {
                   child: FittedBox(
                     fit: BoxFit.cover,
                     child: SizedBox(
-                      width: cameraController!.value.previewSize!.height,
-                      height: cameraController!.value.previewSize!.width,
+                      width: cameraController!.value.previewSize?.height ?? MediaQuery.of(context).size.width,
+                      height: cameraController!.value.previewSize?.width ?? MediaQuery.of(context).size.height,
                       child: CameraPreview(cameraController!),
                     ),
                   ),

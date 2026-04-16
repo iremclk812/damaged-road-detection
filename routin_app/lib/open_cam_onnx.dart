@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'dart:typed_data';
 import 'package:image/image.dart' as img;
 import 'package:geolocator/geolocator.dart';
+import 'package:latlong2/latlong.dart' as ll;
 import 'dart:async';
 
 class OpenCam extends StatefulWidget {
@@ -263,6 +264,51 @@ class OpenCamState extends State<OpenCam> {
               String detectedClass =
                   maxIndex < labels.length ? labels[maxIndex] : "Bilinmeyen";
 
+              // ====== YENİ: UZAKLIK VE GERÇEK KOORDİNAT HESABI ======
+              double distanceToDefect = 0.0;
+              ll.LatLng? defectRealLocation;
+
+              if (currentPosition != null) {
+                // 'y' kutunun merkezi, 'h' yüksekliğidir.
+                // y + (h/2) formülü, dikdörtgenin/çukurun ekrandaki en alt kısmını yani kameraya en yakın noktasını verir.
+                double bottomY = y + (h / 2);
+
+                // --- 1. Mesafe Formülü (Ampirik Kamera Yüksekliği Yaklaşımı) ---
+                // Görüntü (640x640): 0 noktası ekranın en üstü, 640 en altı.
+                // Çukur çizgisinin tabanı `bottomY` ne kadar yüksekse (640'a yakınsa), çukur araca o kadar YAKINDIR.
+                // Ufuk çizgisi 320 civarıdır (Ufuktaki nesnenin uzaklığı sonsuzdur).
+                // DİKKAT: Bu '1200' çarpanı arabanın kamera yüksekliği ve kameranın cama vurduğu açıya göre belirlenen VARSAYIMSAL (KALİBRE EDİLMESİ GEREKEN) bir katsayıdır.
+                // Sensör (Tilt/Pitch) entegre edilene kadar çukur uzaklık tahmini bu ampirik formülle yapılır.
+                if (bottomY > 320) {
+                  // Basit Kalibrasyon Katsayısı: Bu katsayı aracın kamera yüksekliği ve açısına göre ayarlanabilir.
+                  // Matematik: Uzaklık = Katsayı / (bottomY - UfukÇizgisiY)
+                  distanceToDefect = 1200 / (bottomY - 320);
+                } else {
+                  // Y ekseninde çukur ufuk çizgisinin yukarısında bulunamaz. Bulunduysa model hatalı veya uzağı seçmiştir.
+                  distanceToDefect = 50.0; // Max mesafe varsayıyoruz.
+                }
+
+                // --- 2. Gecikme (Latency) Telafisi ---
+                // Fotoğraf çekildi, Isolate dönüştürdü, Model çalıştı... Yaklaşık 1-2 saniye geriden geliyoruz.
+                // Araç bu sırada ilerlemeye devam etti.
+                // Hız (m/s) * Gecikme (saniye) = Gidilen Mesafe.
+                // Bu mesafeyi çukurun asıl uzaklığından çıkartmalıyız ki, veritabanına yazdığımızda aracı geçmiş olmasın.
+                double latencyDelaySeconds = 1.0; // 1 saniye ping varsayalım
+                double offsetDueToSpeed = (currentSpeedKmh / 3.6) * latencyDelaySeconds;
+                double adjustedDistance = distanceToDefect - offsetDueToSpeed;
+
+                // Aracın çukuru çoktan geçmiş olma ihtimaline karşı min mesafeyi 0 yapalım
+                if (adjustedDistance < 0) adjustedDistance = 0;
+
+                // --- 3. Pusula (Heading) ve LatLong2 ile Çukurun Gerçek Konumunu Bulma ---
+                final ll.Distance distanceTool = ll.Distance();
+                final ll.LatLng myVehicleLocation = ll.LatLng(currentPosition!.latitude, currentPosition!.longitude);
+
+                // Araç konumundan, pusula yönüne doğru 'adjustedDistance' kadar ilerle ve o noktanın koordinatını ver!
+                defectRealLocation = distanceTool.offset(myVehicleLocation, adjustedDistance, currentPosition!.heading);
+              }
+              // ========================================================
+
               print("🔍 Tespit adayı: $detectedClass");
               print("   Objectness: ${(confidence * 100).toStringAsFixed(1)}%");
               print("   Class score: ${(maxScore * 100).toStringAsFixed(1)}%");
@@ -274,9 +320,13 @@ class OpenCamState extends State<OpenCam> {
                 potHoleDetected = true;
 
                 // Konum ve hız verilerini ekrana (şimdilik string olarak) bas
-                String posText = currentPosition != null
-                    ? "Konum: ${currentPosition!.latitude.toStringAsFixed(4)}, ${currentPosition!.longitude.toStringAsFixed(4)}\nHız: ${currentSpeedKmh.toStringAsFixed(1)} km/h\nYön: ${currentPosition!.heading.toStringAsFixed(1)}°"
-                    : "Konum/Hız bilgisi yok";
+                String posText = "Konum/Hız bilgisi yok";
+                if (currentPosition != null && defectRealLocation != null) {
+                   posText = "Araç Konumu: ${currentPosition!.latitude.toStringAsFixed(5)}, ${currentPosition!.longitude.toStringAsFixed(5)}\n"
+                             "Hız: ${currentSpeedKmh.toStringAsFixed(1)} km/h\n"
+                             "Çukura Uzaklık: ${distanceToDefect.toStringAsFixed(1)} m\n\n"
+                             "📍 Çukurun GERÇEK Konumu:\n${defectRealLocation.latitude.toStringAsFixed(5)}, ${defectRealLocation.longitude.toStringAsFixed(5)}";
+                }
 
                 setState(() {
                   result =

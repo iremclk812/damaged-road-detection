@@ -41,6 +41,7 @@ dependencies:
   tflite_flutter: ^0.12.1
   image: ^4.8.0
   ffi: ^2.1.0
+  geolocator: ^14.0.2
 dev_dependencies:
   flutter_test:
     sdk: flutter

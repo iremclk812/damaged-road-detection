@@ -5,6 +5,8 @@ import 'package:onnxruntime/onnxruntime.dart';
 import 'package:flutter/services.dart';
 import 'dart:typed_data';
 import 'package:image/image.dart' as img;
+import 'package:geolocator/geolocator.dart';
+import 'dart:async';
 
 class OpenCam extends StatefulWidget {
   const OpenCam({super.key});
@@ -24,11 +26,72 @@ class OpenCamState extends State<OpenCam> {
   OrtSession? session;
   int lastProcessingTime = 0; // Buffer/throttle iin son işlenme zamanı
 
+  // --- GPS LOCATOR VERİLERİ ---
+  Position? currentPosition;
+  StreamSubscription<Position>? positionStream;
+  double currentSpeedKmh = 0.0;
+  String locationStatus = "Konum aranıyor...";
+
   @override
   void initState() {
     super.initState();
     // Kamerayı başlat
     initCamera();
+    // GPS başlat
+    _initLocation();
+  }
+
+  Future<void> _initLocation() async {
+    bool serviceEnabled;
+    LocationPermission permission;
+
+    // Servis açık mı?
+    serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      setState(() {
+        locationStatus = "Konum servisi kapalı.";
+      });
+      return;
+    }
+
+    permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) {
+        setState(() {
+          locationStatus = "Konum izni reddedildi.";
+        });
+        return;
+      }
+    }
+
+    if (permission == LocationPermission.deniedForever) {
+      setState(() {
+        locationStatus = "Konum izni kalıcı reddedildi.";
+      });
+      return;
+    }
+
+    setState(() {
+      locationStatus = "Konum bulunuyor...";
+    });
+
+    // Anlık konum akışı başlat, çok hassas veri gerek - Otonom araç gibi
+    positionStream = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.bestForNavigation, // En yüksek hassasiyet
+        distanceFilter: 1, // Her 1 metrede gncelle
+      ),
+    ).listen((Position position) {
+      if (mounted) {
+        setState(() {
+          currentPosition = position;
+          // Geolocator hızı m/s (metre/saniye) cinsinden verir, biz km/h yapıyoruz (* 3.6)
+          currentSpeedKmh = (position.speed * 3.6);
+          locationStatus = "GPS Aktif";
+        });
+      }
+    });
   }
 
   void initCamera() async {
@@ -210,9 +273,14 @@ class OpenCamState extends State<OpenCam> {
               if (finalConfidence > 0.25) {
                 potHoleDetected = true;
 
+                // Konum ve hız verilerini ekrana (şimdilik string olarak) bas
+                String posText = currentPosition != null
+                    ? "Konum: ${currentPosition!.latitude.toStringAsFixed(4)}, ${currentPosition!.longitude.toStringAsFixed(4)}\nHız: ${currentSpeedKmh.toStringAsFixed(1)} km/h\nYön: ${currentPosition!.heading.toStringAsFixed(1)}°"
+                    : "Konum/Hız bilgisi yok";
+
                 setState(() {
                   result =
-                      "⚠️ Yol Hasarı: $detectedClass\nGüven: ${(finalConfidence * 100).toStringAsFixed(1)}%";
+                      "⚠️ Yol Hasarı: $detectedClass\nGüven: ${(finalConfidence * 100).toStringAsFixed(1)}%\n\n$posText";
                 });
 
                 break;
@@ -246,11 +314,12 @@ class OpenCamState extends State<OpenCam> {
 
   @override
   void dispose() {
-    super.dispose();
+    positionStream?.cancel();
     if (cameraController != null && cameraController!.value.isInitialized) {
       cameraController!.dispose();
     }
     session?.release();
+    super.dispose();
   }
 
   @override

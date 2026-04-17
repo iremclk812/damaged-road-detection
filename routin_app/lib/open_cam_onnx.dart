@@ -10,6 +10,8 @@ import 'package:latlong2/latlong.dart' as ll;
 import 'package:sensors_plus/sensors_plus.dart';
 import 'dart:async';
 import 'dart:math' as math;
+import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart' as p;
 
 class OpenCam extends StatefulWidget {
   const OpenCam({super.key});
@@ -29,7 +31,6 @@ class OpenCamState extends State<OpenCam> {
   OrtSession? session;
   int lastProcessingTime = 0; // Buffer/throttle iin son işlenme zamanı
 
-  // --- SEYAHAT VE TESPİT BUFFER'I ---
   DateTime sessionStartTime = DateTime.now();
   List<Map<String, dynamic>> detectionBuffer = []; // Tüm tespitlerin tutulduğu log buffer'ı
   double cameraCalibrationFactor = 1200.0; // Kamera açısı ve yüksekliği için kalibrasyon katsayısı
@@ -49,6 +50,9 @@ class OpenCamState extends State<OpenCam> {
   // Gerçek bir çukur hissi (anormal sarsıntı) için eşik değerini 6'dan 15'e çıkarıyoruz.
   final double bumpThreshold = 15.0;
 
+  // --- DATABASE VERİLERİ ---
+  Database? _sessionDatabase;
+
   // --- Bounding Box Verileri ---
   double? boxX;
   double? boxY;
@@ -59,12 +63,50 @@ class OpenCamState extends State<OpenCam> {
   @override
   void initState() {
     super.initState();
-    // Kamerayı başlat
-    initCamera();
-    // GPS başlat
-    _initLocation();
-    // Sensör başlat
-    _initSensors();
+    // Veritabanını başlat
+    _initDatabase().then((_) {
+      // Kamerayı başlat
+      initCamera();
+      // GPS başlat
+      _initLocation();
+      // Sensör başlat
+      _initSensors();
+    });
+  }
+
+  Future<void> _initDatabase() async {
+    // Session bazlı değil, kalıcı olarak cihaza kaydetmek için filePath alalım
+    final dbPath = await getDatabasesPath();
+    final path = p.join(dbPath, 'roadguard_database.db');
+    
+    _sessionDatabase = await openDatabase(
+      path,
+      version: 1,
+      onCreate: (db, version) async {
+        await db.execute('''
+          CREATE TABLE session_detections(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            defectType TEXT,
+            confidence REAL,
+            latitude REAL,
+            longitude REAL,
+            speedKmh REAL,
+            distanceToDefect REAL,
+            isSensorConfirmed INTEGER
+          )
+        ''');
+        await db.execute('''
+          CREATE TABLE session_vibrations(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            latitude REAL,
+            longitude REAL,
+            magnitude REAL
+          )
+        ''');
+      },
+    );
   }
 
   void _initSensors() {
@@ -93,6 +135,16 @@ class OpenCamState extends State<OpenCam> {
       if (DateTime.now().difference(lastTime).inMilliseconds < 1000) {
         return; // Aynı sarsıntının kuyruğu, yoksay
       }
+    }
+
+    // Veritabanına kaydet
+    if (_sessionDatabase != null) {
+      _sessionDatabase!.insert('session_vibrations', {
+        'timestamp': DateTime.now().toIso8601String(),
+        'latitude': currentPosition!.latitude,
+        'longitude': currentPosition!.longitude,
+        'magnitude': magnitude,
+      });
     }
 
     // Sarsıntı olarak Buffer'da tut
@@ -234,7 +286,6 @@ class OpenCamState extends State<OpenCam> {
 
     try {
       // Isolate için veriyi Map haline getiriyoruz (CameraImage kopyalanamaz, sadece verilerini aktarabiliriz)
-      // ÖNEMLİ: BufferQueueProducer Timeout hatasını önlemek için Native referansı hemen kopyalayarak serbest bırakıyoruz!
       final List<Map<String, dynamic>> planeData = imgCamera!.planes.map((plane) {
         return {
           'bytes': Uint8List.fromList(plane.bytes), // Hard Copy yapılarak native bellek kilidi kaldırılır
@@ -416,6 +467,20 @@ class OpenCamState extends State<OpenCam> {
 
                 Duration travelTime = DateTime.now().difference(sessionStartTime);
 
+                // Veritabanına tespiti kaydet
+                if (_sessionDatabase != null && currentPosition != null && defectRealLocation != null) {
+                  _sessionDatabase!.insert('session_detections', {
+                    'timestamp': DateTime.now().toIso8601String(),
+                    'defectType': detectedClass,
+                    'confidence': finalConfidence,
+                    'latitude': defectRealLocation.latitude,
+                    'longitude': defectRealLocation.longitude,
+                    'speedKmh': currentSpeedKmh,
+                    'distanceToDefect': distanceToDefect,
+                    'isSensorConfirmed': isCorrelatedWithSensor ? 1 : 0,
+                  });
+                }
+
                 // Hatayı ana detectionBuffer'a (hız, seyahat süresi, koordinatlar ile) kaydet
                 detectionBuffer.add({
                   'timestamp': DateTime.now(),
@@ -428,8 +493,6 @@ class OpenCamState extends State<OpenCam> {
                   'distanceToDefect': distanceToDefect,
                   'isSensorConfirmed': isCorrelatedWithSensor,
                 });
-
-                // Konum ve hız verilerini ekrana (şimdilik string olarak) bas
                 String posText = "No Location/Speed data";
                 if (currentPosition != null && defectRealLocation != null) {
                    posText = "Vehicle Location: ${currentPosition!.latitude.toStringAsFixed(5)}, ${currentPosition!.longitude.toStringAsFixed(5)}\n"
@@ -492,6 +555,7 @@ class OpenCamState extends State<OpenCam> {
       cameraController!.dispose();
     }
     session?.release();
+    _sessionDatabase?.close();
     super.dispose();
   }
 
@@ -711,7 +775,6 @@ class OpenCamState extends State<OpenCam> {
 }
 
 // === ISOLATE (ARKA PLAN THREAD) İÇİN TOP-LEVEL FONKSİYON ===
-// Görüntünün işlenmesi 1 milyondan fazla piksel döndürdüğü için arayüzü dondurmadan burada çalışır.
 Future<Float32List?> _processCameraImageInIsolate(Map<String, dynamic> params) async {
   try {
     final int width = params['width'];

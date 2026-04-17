@@ -8,6 +8,7 @@ This project aims to improve road safety and support smart city infrastructure b
 
 🚀 Features
 🧠 AI-Based Detection
+
 Detects road damages using deep learning models on camera input.
 📍 Real-Time Location Tracking
 Uses GPS data to estimate the real-world coordinates of detected defects.

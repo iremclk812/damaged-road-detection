@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:onnxruntime/onnxruntime.dart';
 import 'package:flutter/services.dart';
 import 'dart:typed_data';
+import 'dart:io';
 import 'package:image/image.dart' as img;
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart' as ll;
@@ -40,6 +41,8 @@ class OpenCamState extends State<OpenCam> {
   StreamSubscription<Position>? positionStream;
   double currentSpeedKmh = 0.0;
   String locationStatus = "Searching location...";
+
+  Uint8List? lastFrameBytes;
 
   // --- SENSÖR (İVMEÖLÇER/TİTREŞİM) VERİLERİ ---
   StreamSubscription<UserAccelerometerEvent>? accelStream;
@@ -93,7 +96,8 @@ class OpenCamState extends State<OpenCam> {
             longitude REAL,
             speedKmh REAL,
             distanceToDefect REAL,
-            isSensorConfirmed INTEGER
+            isSensorConfirmed INTEGER,
+            imagePath TEXT
           )
         ''');
         await db.execute('''
@@ -119,15 +123,16 @@ class OpenCamState extends State<OpenCam> {
         lastVibrationMagnitude = magnitude;
 
         // Anormal bir sarsıntı (çukur) tespit edildiğinde:
-        if (magnitude > bumpThreshold && currentPosition != null) {
+        if (magnitude > bumpThreshold) {
           _recordPhysicalBump(magnitude);
         }
       }
     });
   }
 
-  void _recordPhysicalBump(double magnitude) {
-    if (currentPosition == null) return;
+  void _recordPhysicalBump(double magnitude) async {
+    double lat = currentPosition?.latitude ?? 0.0;
+    double lng = currentPosition?.longitude ?? 0.0;
 
     // Aynı saniyede peş peşe 10 tane ivme verisi girmesin diye son eklenenle zaman farkına bakıyoruz
     if (bumpBuffer.isNotEmpty) {
@@ -137,21 +142,45 @@ class OpenCamState extends State<OpenCam> {
       }
     }
 
+    String? savedImagePath;
+    if (lastFrameBytes != null) {
+      try {
+        final dbPath = await getDatabasesPath();
+        final imgFile = File(p.join(dbPath, 'bump_${DateTime.now().millisecondsSinceEpoch}.jpg'));
+        await imgFile.writeAsBytes(lastFrameBytes!);
+        savedImagePath = imgFile.path;
+      } catch (e) {
+        print("Görüntü kaydedilemedi: $e");
+      }
+    }
+
     // Veritabanına kaydet
     if (_sessionDatabase != null) {
       _sessionDatabase!.insert('session_vibrations', {
         'timestamp': DateTime.now().toIso8601String(),
-        'latitude': currentPosition!.latitude,
-        'longitude': currentPosition!.longitude,
+        'latitude': lat,
+        'longitude': lng,
         'magnitude': magnitude,
+      });
+
+      _sessionDatabase!.insert('session_detections', {
+        'timestamp': DateTime.now().toIso8601String(),
+        'defectType': 'Bump (Sensor)',
+        'confidence': 1.0,
+        'latitude': lat,
+        'longitude': lng,
+        'speedKmh': currentSpeedKmh,
+        'distanceToDefect': 0.0,
+        'isSensorConfirmed': 1,
+        'imagePath': savedImagePath,
       });
     }
 
     // Sarsıntı olarak Buffer'da tut
     bumpBuffer.add({
       'time': DateTime.now(),
-      'latitude': currentPosition!.latitude,
-      'longitude': currentPosition!.longitude,
+      'latitude': lat,
+      'longitude': lng,
       'magnitude': magnitude,
     });
 
@@ -159,6 +188,20 @@ class OpenCamState extends State<OpenCam> {
     if (bumpBuffer.length > 20) {
       bumpBuffer.removeAt(0);
     }
+    
+    // Sensör direkt sarsıntı algıladı, uyarıyı ekrana yazdır (Kamera modeli bozuk yol algılamasa bile)
+    setState(() {
+      result = "🚨 BUMP DETECTED (Sensor)!\nMagnitude: ${magnitude.toStringAsFixed(1)}\n"
+               "Vehicle Location: ${lat.toStringAsFixed(5)}, ${lng.toStringAsFixed(5)}\n"
+               "Speed: ${currentSpeedKmh.toStringAsFixed(1)} km/h";
+      
+      // Kutu çizimini iptal et (sadece sensör verisi ise)
+      boxX = null;
+      boxY = null;
+      boxW = null;
+      boxH = null;
+      boxLabel = null;
+    });
   }
 
   Future<void> _initLocation() async {
@@ -302,14 +345,17 @@ class OpenCamState extends State<OpenCam> {
 
       // Ağır işlemleri (YUV->RGB Dönüşümü, Döndürme, Yeniden Boyutlandırma, Float32List oluşturma)
       // başka bir Thread'de (Isolate'te) bilgisayarı dondurmadan yapıyoruz!
-      final Float32List? inputData = await compute(_processCameraImageInIsolate, isolateParams);
+      final Map<String, dynamic>? isolateResult = await compute(_processCameraImageInIsolate, isolateParams);
 
-      if (inputData == null) {
+      if (isolateResult == null) {
         print("Görüntü dönüştürme başarısız (Isolate Hatası)");
         isWorking = false;
         return;
       }
 
+      final Float32List inputData = isolateResult['tensor'];
+      final Uint8List jpgBytes = isolateResult['image'];
+      lastFrameBytes = jpgBytes; // Son kareyi kaydet (sensör sarsılırsa kullanmak için)
 
       print("Input hazır: ${inputData.length} değer");
 
@@ -322,7 +368,9 @@ class OpenCamState extends State<OpenCam> {
       // Inference çalıştır
       final inputs = {'images': inputOrt};
       final runOptions = OrtRunOptions();
-      final outputs = session!.run(runOptions, inputs);
+      
+      // RUNASYNC kullanarak UI'ın donmasını engelliyoruz
+      final outputs = await session!.runAsync(runOptions, inputs) ?? [];
 
       print("Inference tamamlandı");
 
@@ -447,13 +495,15 @@ class OpenCamState extends State<OpenCam> {
                     break;
                   }
                 }
-
-                // Çıktıya sensör desteği metnini ekleyelim
-                if (isCorrelatedWithSensor) {
-                    detectedClass += " (SENSOR CONFIRMED 🚨)";
-                }
+              } else {
+                 defectRealLocation = const ll.LatLng(0.0, 0.0);
               }
-              // ========================================================
+
+              // Çıktıya sensör desteği metnini ekleyelim
+              if (isCorrelatedWithSensor) {
+                  detectedClass += " (SENSOR CONFIRMED 🚨)";
+              }
+            // ========================================================
 
               print("🔍 Tespit adayı: $detectedClass");
               print("   Objectness: ${(confidence * 100).toStringAsFixed(1)}%");
@@ -467,17 +517,28 @@ class OpenCamState extends State<OpenCam> {
 
                 Duration travelTime = DateTime.now().difference(sessionStartTime);
 
+                String? savedImagePath;
+                try {
+                  final dbPath = await getDatabasesPath();
+                  final imgFile = File(p.join(dbPath, 'defect_${DateTime.now().millisecondsSinceEpoch}.jpg'));
+                  await imgFile.writeAsBytes(jpgBytes);
+                  savedImagePath = imgFile.path;
+                } catch (e) {
+                  print("Görüntü kaydedilemedi: $e");
+                }
+
                 // Veritabanına tespiti kaydet
-                if (_sessionDatabase != null && currentPosition != null && defectRealLocation != null) {
+                if (_sessionDatabase != null) {
                   _sessionDatabase!.insert('session_detections', {
                     'timestamp': DateTime.now().toIso8601String(),
                     'defectType': detectedClass,
                     'confidence': finalConfidence,
-                    'latitude': defectRealLocation.latitude,
-                    'longitude': defectRealLocation.longitude,
+                    'latitude': defectRealLocation?.latitude ?? 0.0,
+                    'longitude': defectRealLocation?.longitude ?? 0.0,
                     'speedKmh': currentSpeedKmh,
                     'distanceToDefect': distanceToDefect,
                     'isSensorConfirmed': isCorrelatedWithSensor ? 1 : 0,
+                    'imagePath': savedImagePath,
                   });
                 }
 
@@ -727,6 +788,30 @@ class OpenCamState extends State<OpenCam> {
                   ),
                 ),
 
+                Positioned(
+                  bottom: 30,
+                  left: 0,
+                  right: 0,
+                  child: Center(
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.black.withOpacity(0.7),
+                        foregroundColor: Colors.orangeAccent,
+                        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+                      ),
+                      onPressed: () {
+                        Navigator.pushNamed(context, '/history');
+                      },
+                      icon: const Icon(Icons.history),
+                      label: const Text(
+                        "View Records",
+                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                  ),
+                ),
+
                 // Tespit uyarısı
                 if (result.isNotEmpty)
                   Positioned(
@@ -775,7 +860,7 @@ class OpenCamState extends State<OpenCam> {
 }
 
 // === ISOLATE (ARKA PLAN THREAD) İÇİN TOP-LEVEL FONKSİYON ===
-Future<Float32List?> _processCameraImageInIsolate(Map<String, dynamic> params) async {
+Future<Map<String, dynamic>?> _processCameraImageInIsolate(Map<String, dynamic> params) async {
   try {
     final int width = params['width'];
     final int height = params['height'];
@@ -836,7 +921,10 @@ Future<Float32List?> _processCameraImageInIsolate(Map<String, dynamic> params) a
       }
     }
 
-    return inputData;
+    return {
+      'tensor': inputData,
+      'image': img.encodeJpg(resizedImage)
+    };
   } catch (e) {
     print("Isolate İçinde Kritik Hata: $e");
     return null;

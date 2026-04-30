@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
+import 'dart:io';
 
 class HistoryScreen extends StatefulWidget {
   const HistoryScreen({super.key});
@@ -66,6 +67,28 @@ class _HistoryScreenState extends State<HistoryScreen> {
       }
     } catch (e) {
       debugPrint("Error clearing history: $e");
+    }
+  }
+
+
+  Future<void> _deleteItem(int id) async {
+    try {
+      final dbPath = await getDatabasesPath();
+      final path = p.join(dbPath, 'roadguard_database.db');
+
+      final db = await openDatabase(path);
+      await db.delete('session_detections', where: 'id = ?', whereArgs: [id]);
+      await db.close();
+
+      _loadHistory(); // Listeyi yenile
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Record deleted.')),
+        );
+      }
+    } catch (e) {
+      debugPrint("Error deleting record: $e");
     }
   }
 
@@ -136,27 +159,39 @@ class _HistoryScreenState extends State<HistoryScreen> {
                   itemCount: _detections.length,
                   itemBuilder: (context, index) {
                     final item = _detections[index];
+                    final id = item['id'] as int?;
                     final defectType = item['defectType'] as String? ?? 'Unknown';
                     final conf = (item['confidence'] as num? ?? 0.0) * 100;
                     final lat = item['latitude'] as num? ?? 0.0;
                     final lng = item['longitude'] as num? ?? 0.0;
                     final time = item['timestamp'] as String? ?? '';
                     final isSensor = (item['isSensorConfirmed'] as int? ?? 0) == 1;
+                    final imagePath = item['imagePath'] as String?;
 
                     return Card(
                       color: const Color(0xFF2A2A2A),
                       margin: const EdgeInsets.only(bottom: 12),
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                      child: ListTile(
-                        contentPadding: const EdgeInsets.all(16),
-                        leading: CircleAvatar(
-                          backgroundColor: isSensor ? Colors.redAccent.withValues(alpha: 0.2) : Colors.orangeAccent.withValues(alpha: 0.2),
-                          radius: 25,
-                          child: Icon(
-                            isSensor ? Icons.warning_amber_rounded : Icons.camera_alt,
-                            color: isSensor ? Colors.redAccent : Colors.orangeAccent,
-                          ),
-                        ),
+                      child: ExpansionTile(
+                        tilePadding: const EdgeInsets.all(16),
+                        leading: imagePath != null && File(imagePath).existsSync()
+                            ? ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: Image.file(
+                                  File(imagePath),
+                                  width: 60,
+                                  height: 60,
+                                  fit: BoxFit.cover,
+                                ),
+                              )
+                            : CircleAvatar(
+                                backgroundColor: isSensor ? Colors.redAccent.withValues(alpha: 0.2) : Colors.orangeAccent.withValues(alpha: 0.2),
+                                radius: 25,
+                                child: Icon(
+                                  isSensor ? Icons.warning_amber_rounded : Icons.camera_alt,
+                                  color: isSensor ? Colors.redAccent : Colors.orangeAccent,
+                                ),
+                              ),
                         title: Text(
                           "$defectType (${conf.toStringAsFixed(1)}%)",
                           style: const TextStyle(
@@ -189,6 +224,39 @@ class _HistoryScreenState extends State<HistoryScreen> {
                               )
                           ],
                         ),
+                        trailing: IconButton(
+                          icon: const Icon(Icons.delete_outline, color: Colors.grey),
+                          onPressed: () {
+                            if (id != null) {
+                              _deleteItem(id);
+                            }
+                          },
+                          tooltip: 'Delete record',
+                        ),
+                        children: [
+                          if (imagePath != null && File(imagePath).existsSync())
+                            Padding(
+                              padding: const EdgeInsets.all(16.0),
+                              child: Column(
+                                children: [
+                                  const Text("Captured Frame:", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                                  const SizedBox(height: 10),
+                                  ClipRRect(
+                                    borderRadius: BorderRadius.circular(12),
+                                    child: Image.file(
+                                      File(imagePath),
+                                      fit: BoxFit.contain,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            )
+                          else
+                            const Padding(
+                              padding: EdgeInsets.all(16.0),
+                              child: Text("No image captured for this detection.", style: TextStyle(color: Colors.grey)),
+                            )
+                        ],
                       ),
                     );
                   },
@@ -196,4 +264,3 @@ class _HistoryScreenState extends State<HistoryScreen> {
     );
   }
 }
-

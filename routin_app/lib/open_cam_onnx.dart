@@ -272,9 +272,7 @@ class OpenCamState extends State<OpenCam> {
 
     // Stream başlat
     cameraController!.startImageStream((image) {
-      int currentTime = DateTime.now().millisecondsSinceEpoch;
-      // Her 5 saniyede bir frame al
-      if (!isWorking && (currentTime - lastProcessingTime >= 5000)) {
+      if (!isWorking) {
         imgCamera = image;
         runModelOnStreamFrame();
       }
@@ -298,6 +296,7 @@ class OpenCamState extends State<OpenCam> {
 
       // SessionOptions oluştur
       final sessionOptions = OrtSessionOptions();
+      sessionOptions.setIntraOpNumThreads(4); // 4 Çekirdek kullanarak işleme hızını (FPS) artır
 
       // Session oluştur
       session = OrtSession.fromBuffer(bytes, sessionOptions);
@@ -317,10 +316,10 @@ class OpenCamState extends State<OpenCam> {
   Future<void> runModelOnStreamFrame() async {
     if (imgCamera == null || session == null) return;
 
-    // FPS Dengeleyici (Buffer/Throttle): Yeni bir kareyi girmeden nce araya bekleme payı koy(Maks saniyede ~2-3 kare işler)
+    // FPS Dengeleyici (Buffer/Throttle): Yeni bir kareyi girmeden nce araya bekleme payı koy(Maks saniyede ~3-4 kare işler)
     int currentTime = DateTime.now().millisecondsSinceEpoch;
-    if (currentTime - lastProcessingTime < 500) {
-        return; // 500 ms (yarım saniye) gemeden yeni frame işleme
+    if (currentTime - lastProcessingTime < 250) {
+        return; // 250 ms (~4 FPS) bekleme süresi, çukuru kaçırmamak için çok daha hızlı
     }
 
     if (isWorking) return; // Zaten bir kare işleniyorsa atla
@@ -625,21 +624,15 @@ class OpenCamState extends State<OpenCam> {
     return Scaffold(
       backgroundColor: Colors.black,
       body: cameraController == null || !cameraController!.value.isInitialized
-          ? Center(
+          ? const Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  const Icon(
-                    Icons.photo_camera_front,
-                    color: Colors.blueAccent,
-                    size: 60,
-                  ),
-                  const SizedBox(height: 20),
-                  ElevatedButton(
-                    onPressed: () {
-                      initCamera();
-                    },
-                    child: const Text('Open Camera'),
+                  CircularProgressIndicator(color: Colors.orangeAccent),
+                  SizedBox(height: 20),
+                  Text(
+                    "Starting Camera & AI Model...",
+                    style: TextStyle(color: Colors.white, fontSize: 16),
                   ),
                 ],
               ),
@@ -764,8 +757,7 @@ class OpenCamState extends State<OpenCam> {
                           setState(() {});
 
                           cameraController!.startImageStream((image) {
-                            int currentTime = DateTime.now().millisecondsSinceEpoch;
-                            if (!isWorking && (currentTime - lastProcessingTime >= 5000)) {
+                            if (!isWorking) {
                               imgCamera = image;
                               runModelOnStreamFrame();
                             }

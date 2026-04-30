@@ -21,15 +21,6 @@ class _StartpaageState extends State<Startpaage> {
           style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, letterSpacing: 1.5),
         ),
         centerTitle: true,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.history, color: Colors.orangeAccent),
-            onPressed: () {
-              Navigator.pushNamed(context, '/history');
-            },
-            tooltip: 'Detection History',
-          ),
-        ],
       ),
       backgroundColor: const Color(0xFF121212),
       body: Center(

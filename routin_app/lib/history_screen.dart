@@ -145,6 +145,15 @@ class _HistoryScreenState extends State<HistoryScreen> {
         ],
       ),
       backgroundColor: const Color(0xFF121212),
+      floatingActionButton: FloatingActionButton.extended(
+        backgroundColor: Colors.orangeAccent,
+        foregroundColor: Colors.black87,
+        onPressed: () {
+          Navigator.pushReplacementNamed(context, '/open_camera');
+        },
+        icon: const Icon(Icons.camera_alt),
+        label: const Text("Open Camera", style: TextStyle(fontWeight: FontWeight.bold)),
+      ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator(color: Colors.orangeAccent))
           : _detections.isEmpty

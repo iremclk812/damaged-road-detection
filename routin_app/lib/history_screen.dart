@@ -29,7 +29,35 @@ class _HistoryScreenState extends State<HistoryScreen> {
       final dbPath = await getDatabasesPath();
       final path = p.join(dbPath, 'roadguard_database.db');
 
-      final db = await openDatabase(path);
+      final db = await openDatabase(
+        path,
+        version: 1,
+        onCreate: (db, version) async {
+          await db.execute('''
+            CREATE TABLE session_detections(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              timestamp TEXT,
+              defectType TEXT,
+              confidence REAL,
+              latitude REAL,
+              longitude REAL,
+              speedKmh REAL,
+              distanceToDefect REAL,
+              isSensorConfirmed INTEGER,
+              imagePath TEXT
+            )
+          ''');
+          await db.execute('''
+            CREATE TABLE session_vibrations(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              timestamp TEXT,
+              latitude REAL,
+              longitude REAL,
+              magnitude REAL
+            )
+          ''');
+        },
+      );
 
       // Kaydedilen tespitleri id'ye göre azalan (en yeni en üstte) şekilde getir.
       final result = await db.query('session_detections', orderBy: 'id DESC');

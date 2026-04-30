@@ -14,6 +14,8 @@ import 'dart:math' as math;
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
 
+OrtSession? globalOrtSession;
+
 class OpenCam extends StatefulWidget {
   const OpenCam({super.key});
 
@@ -21,7 +23,7 @@ class OpenCam extends StatefulWidget {
   State<OpenCam> createState() => OpenCamState();
 }
 
-class OpenCamState extends State<OpenCam> {
+class OpenCamState extends State<OpenCam> with WidgetsBindingObserver {
   CameraController? cameraController;
   CameraImage? imgCamera;
   int frameCount = 0;
@@ -48,10 +50,8 @@ class OpenCamState extends State<OpenCam> {
   StreamSubscription<UserAccelerometerEvent>? accelStream;
   List<Map<String, dynamic>> bumpBuffer = []; // Fiziksel olarak hissedilen çukurlar/sarsıntılar
   double lastVibrationMagnitude = 0.0;
-  // Eşiği ayarlayabilirsiniz (m/s^2 cinsinden ani ivme değişimi)
-  // Telefon elde tutulurken veya araç normal seyrindeyken ufak sarsıntılar üretebilir.
-  // Gerçek bir çukur hissi (anormal sarsıntı) için eşik değerini 6'dan 15'e çıkarıyoruz.
-  final double bumpThreshold = 15.0;
+  // Araç içindeyken telefon tutacağındaki sarsıntıları yakalamak için threshold düşürüldü.
+  final double bumpThreshold = 5.0;
 
   // --- DATABASE VERİLERİ ---
   Database? _sessionDatabase;
@@ -66,18 +66,18 @@ class OpenCamState extends State<OpenCam> {
   @override
   void initState() {
     super.initState();
-    // Veritabanını başlat
-    _initDatabase().then((_) {
-      // Kamerayı başlat
-      initCamera();
-      // GPS başlat
-      _initLocation();
-      // Sensör başlat
-      _initSensors();
+    WidgetsBinding.instance.addObserver(this);
+
+    _initDB().then((_) {
+      _initializeCamera();
+      _loadModel();
     });
+
+    _initSensors();
+    _initLocation();
   }
 
-  Future<void> _initDatabase() async {
+  Future<void> _initDB() async {
     // Session bazlı değil, kalıcı olarak cihaza kaydetmek için filePath alalım
     final dbPath = await getDatabasesPath();
     final path = p.join(dbPath, 'roadguard_database.db');
@@ -111,6 +111,68 @@ class OpenCamState extends State<OpenCam> {
         ''');
       },
     );
+  }
+
+  void _initializeCamera() async {
+    final cameras = await availableCameras();
+    // Medium çözünürlük - tespit için yeterli
+    cameraController = CameraController(cameras[0], ResolutionPreset.medium);
+    await cameraController!.initialize();
+
+    if (!mounted) return;
+
+    setState(() {});
+
+    // Stream başlat
+    cameraController!.startImageStream((image) {
+      if (!isWorking) {
+        imgCamera = image;
+        runModelOnStreamFrame();
+      }
+    });
+  }
+
+  Future<void> _loadModel() async {
+    try {
+      if (globalOrtSession != null) {
+        session = globalOrtSession;
+        labels = ['D00', 'D10', 'D20', 'D40'];
+        print("✓ ONNX model reused from cache!");
+        setState(() {});
+        return;
+      }
+
+      print("Model yükleniyor...");
+
+      // Labels - RDDC2020 road damage classes (hardcoded)
+      labels = ['D00', 'D10', 'D20', 'D40'];
+      print("Labels: $labels");
+      print(
+          "D00=Boyuna Çatlak, D10=Enine Çatlak, D20=Timsah Çatlak, D40=Çukur");
+
+      // ONNX modeli yükle
+      const assetFileName = 'assets/road_damage.onnx';
+      final rawAssetFile = await rootBundle.load(assetFileName);
+      final bytes = rawAssetFile.buffer.asUint8List();
+
+      // SessionOptions oluştur
+      final sessionOptions = OrtSessionOptions();
+      sessionOptions.setIntraOpNumThreads(4); // 4 Çekirdek kullanarak işleme hızını (FPS) artır
+
+      // Session oluştur
+      globalOrtSession = OrtSession.fromBuffer(bytes, sessionOptions);
+      session = globalOrtSession;
+
+      print("✓ ONNX model yüklendi!");
+
+      // Model bilgilerini göster
+      final inputNames = session!.inputNames;
+      final outputNames = session!.outputNames;
+      print("Input names: $inputNames");
+      print("Output names: $outputNames");
+    } catch (e) {
+      print("Model yükleme hatası: $e");
+    }
   }
 
   void _initSensors() {
@@ -281,6 +343,13 @@ class OpenCamState extends State<OpenCam> {
 
   Future<void> loadModel() async {
     try {
+      if (globalOrtSession != null) {
+        session = globalOrtSession;
+        labels = ['D00', 'D10', 'D20', 'D40'];
+        print("✓ ONNX model reused from cache!");
+        return;
+      }
+
       print("Model yükleniyor...");
 
       // Labels - RDDC2020 road damage classes (hardcoded)
@@ -299,7 +368,8 @@ class OpenCamState extends State<OpenCam> {
       sessionOptions.setIntraOpNumThreads(4); // 4 Çekirdek kullanarak işleme hızını (FPS) artır
 
       // Session oluştur
-      session = OrtSession.fromBuffer(bytes, sessionOptions);
+      globalOrtSession = OrtSession.fromBuffer(bytes, sessionOptions);
+      session = globalOrtSession;
 
       print("✓ ONNX model yüklendi!");
 
@@ -346,6 +416,11 @@ class OpenCamState extends State<OpenCam> {
       // başka bir Thread'de (Isolate'te) bilgisayarı dondurmadan yapıyoruz!
       final Map<String, dynamic>? isolateResult = await compute(_processCameraImageInIsolate, isolateParams);
 
+      if (!mounted) {
+        isWorking = false;
+        return;
+      }
+
       if (isolateResult == null) {
         print("Görüntü dönüştürme başarısız (Isolate Hatası)");
         isWorking = false;
@@ -370,6 +445,16 @@ class OpenCamState extends State<OpenCam> {
       
       // RUNASYNC kullanarak UI'ın donmasını engelliyoruz
       final outputs = await session!.runAsync(runOptions, inputs) ?? [];
+
+      if (!mounted) {
+        inputOrt.release();
+        runOptions.release();
+        for (final output in outputs) {
+          output?.release();
+        }
+        isWorking = false;
+        return;
+      }
 
       print("Inference tamamlandı");
 
@@ -612,11 +697,23 @@ class OpenCamState extends State<OpenCam> {
     accelStream?.cancel();
     positionStream?.cancel();
     if (cameraController != null && cameraController!.value.isInitialized) {
+      cameraController!.stopImageStream();
       cameraController!.dispose();
     }
-    session?.release();
+    _releaseModelSafe();
     _sessionDatabase?.close();
     super.dispose();
+  }
+
+  void _releaseModelSafe() async {
+    // ONNX modeli çalışırken dispose edilirse native C tarafında çökme yapar.
+    // Bu yüzden model işlemi bitene kadar bekliyoruz.
+    while (isWorking) {
+      await Future.delayed(const Duration(milliseconds: 50));
+    }
+    // Modeli serbest bırakmıyoruz, global olarak saklıyoruz ki tekrar girişte kasmasın ve anında açılsın!
+    // session?.release();
+    session = null;
   }
 
   @override

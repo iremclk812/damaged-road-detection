@@ -37,6 +37,8 @@ Future<void> main() async {
   }
   runApp(
     MaterialApp(
+      title: 'RoadGuard',
+      debugShowCheckedModeBanner: false,
       home: Startpaage(),
       routes: {
         '/conditions': (context) => const ConditionsPage(),

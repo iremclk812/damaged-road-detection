@@ -46,12 +46,10 @@ class OpenCamState extends State<OpenCam> with WidgetsBindingObserver {
 
   Uint8List? lastFrameBytes;
 
-  // --- SENSÖR (İVMEÖLÇER/TİTREŞİM) VERİLERİ ---
   StreamSubscription<UserAccelerometerEvent>? accelStream;
   List<Map<String, dynamic>> bumpBuffer = []; // Fiziksel olarak hissedilen çukurlar/sarsıntılar
   double lastVibrationMagnitude = 0.0;
-  // Araç içindeyken telefon tutacağındaki sarsıntıları yakalamak için threshold düşürüldü.
-  final double bumpThreshold = 5.0;
+  final double bumpThreshold = 3.0;
 
   // --- DATABASE VERİLERİ ---
   Database? _sessionDatabase;
@@ -199,7 +197,8 @@ class OpenCamState extends State<OpenCam> with WidgetsBindingObserver {
     // Aynı saniyede peş peşe 10 tane ivme verisi girmesin diye son eklenenle zaman farkına bakıyoruz
     if (bumpBuffer.isNotEmpty) {
       final lastTime = bumpBuffer.last['time'] as DateTime;
-      if (DateTime.now().difference(lastTime).inMilliseconds < 1000) {
+      // İki sarsıntı arası sınır 1 saniyeden yarım saniyeye (500ms) düşürüldü
+      if (DateTime.now().difference(lastTime).inMilliseconds < 500) {
         return; // Aynı sarsıntının kuyruğu, yoksay
       }
     }
@@ -388,8 +387,8 @@ class OpenCamState extends State<OpenCam> with WidgetsBindingObserver {
 
     // FPS Dengeleyici (Buffer/Throttle): Yeni bir kareyi girmeden nce araya bekleme payı koy(Maks saniyede ~3-4 kare işler)
     int currentTime = DateTime.now().millisecondsSinceEpoch;
-    if (currentTime - lastProcessingTime < 250) {
-        return; // 250 ms (~4 FPS) bekleme süresi, çukuru kaçırmamak için çok daha hızlı
+    if (currentTime - lastProcessingTime < 150) {
+        return; // 150 ms (~6-7 FPS) bekleme süresi, çukuru anında fark edebilmek için kare sayısı artırıldı
     }
 
     if (isWorking) return; // Zaten bir kare işleniyorsa atla
@@ -486,8 +485,8 @@ class OpenCamState extends State<OpenCam> with WidgetsBindingObserver {
               print("Örnek detection $totalDetections: confidence=$confidence");
             }
 
-            // Güven eşiği - düşük tutuyoruz
-            if (confidence > 0.3) {
+            // Güven eşiği - Modelin çukuru hafif gördüğünde bile hemen sezebilmesi için 0.3'ten 0.25'e düşürüldü
+            if (confidence > 0.25) {
               highConfidenceCount++;
 
               // Bbox koordinatları
@@ -595,8 +594,8 @@ class OpenCamState extends State<OpenCam> with WidgetsBindingObserver {
               print("   Final: ${(finalConfidence * 100).toStringAsFixed(1)}%");
               print("   Bbox: x=$x, y=$y, w=$w, h=$h");
 
-              // Final confidence ile karar ver
-              if (finalConfidence > 0.25) {
+              // Final confidence ile karar ver (Çabuk yakalaması için 0.25'ten 0.20'ye esnetildi)
+              if (finalConfidence > 0.20) {
                 potHoleDetected = true;
 
                 Duration travelTime = DateTime.now().difference(sessionStartTime);

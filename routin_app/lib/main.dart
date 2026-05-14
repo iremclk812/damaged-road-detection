@@ -10,25 +10,13 @@ import 'history_screen.dart';
 
 List<CameraDescription> cameras = [];
 
-Future<void> _clearOldSessionsOnStartup() async {
-  try {
-    final dbPath = await getDatabasesPath();
-    final path = p.join(dbPath, 'roadguard_database.db');
-
-    // Sadece tabloyu silmek istiyorsak open database yapıp DELETE de diyebiliriz
-    // ama en temizi, başlarken tüm DB dosyasını silip taze başlamaktır.
-    await deleteDatabase(path);
-    debugPrint("Old session database deleted on startup.");
-  } catch (e) {
-    debugPrint("DB delete error: $e");
-  }
-}
-
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Uygulama her sıfırdan başladığında eski verilerin tutulduğu veritabanını yok et
+  // Database silme iptal edildi (kullanıcı talebi: DB'de session silinmemesi)
+  /*
   await _clearOldSessionsOnStartup();
+  */
 
   try {
     cameras = await availableCameras();

@@ -51,3 +51,22 @@ app.*.map.json
 
 # Build outputs
 **/build/
+
+# Environment variables
+.env
+
+# Ekstra Flutter ve Dart klasörleri
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Yapay Zeka / Model klasörleri 
+yolov5/
+rddc2020/
+*.db
+*.sqlite
+
+# İşletim sistemi kalıntıları
+.DS_Store
+Thumbs.db

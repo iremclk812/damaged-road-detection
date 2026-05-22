@@ -183,6 +183,41 @@ Map<String, dynamic>? _runInference(
   final int uvRowStride = params['uvRowStride'];
   final int uvPixelStride = params['uvPixelStride'];
 
+  // --- HIZLI BULANIKLIK (BLUR) KONTROLÜ ---
+  // Ağır yapay zekaya girmeden önce resmin netliğini matematiksel piksellerle (zıtlık) test ediyoruz.
+  int gradientSum = 0;
+  int sampleCount = 0;
+  
+  // Kameranın gökyüzü gibi önemsiz kısımlarını atlayıp doğrudan yola odaklanıyoruz
+  int startY = height ~/ 3;
+  int endY = height - 20;
+  int startX = width ~/ 4;
+  int endX = (width * 3) ~/ 4;
+  
+  for (int py = startY; py < endY; py += 4) {
+    int rowIdx = py * yRowStride;
+    for (int px = startX; px < endX; px += 4) {
+      int p1 = yPlane[rowIdx + px];
+      int p2 = yPlane[rowIdx + px + 2]; // Yanındaki pikselle ışık/renk zıtlığına bak
+      gradientSum += (p1 - p2).abs();
+      sampleCount++;
+    }
+  }
+  
+  // Ortalama piksel keskinliği puanı
+  double sharpness = sampleCount > 0 ? (gradientSum / sampleCount) : 0.0;
+  
+  // Eğer kare hareket bulanıklığı yüzünden çok pürüzsüzse (çamurluysa), ağır modeli
+  // hiç yormadan bu kareyi hızlıca pas geç ki kamera yeni bir kare göndersin!
+  if (sharpness < 3.5 && params['skipInference'] != true) {
+    return {
+      'detections': <Map<String, dynamic>>[],
+      'jpegBytes': null,
+      'blurSkipped': true,
+    };
+  }
+  // ----------------------------------------
+
   final inputData = Float32List(1 * 3 * 640 * 640);
 
   final double xScale = width / 640.0;
@@ -277,7 +312,8 @@ Map<String, dynamic>? _runInference(
       final double finalConf = confidence * maxScore;
 
       // Çok düşük tut — model ne gördüyse göster
-      if (finalConf > 0.02) {
+      // Geliştirme: Daha doğru algı ve NMS filtresi için eşiği 0.15'e çekiyoruz
+      if (finalConf > 0.15) {
         detections.add({
           'detectedClass': maxIdx < labels.length ? labels[maxIdx] : 'Unknown',
           'confidence': confidence,
@@ -291,6 +327,37 @@ Map<String, dynamic>? _runInference(
     }
   }
 
+  // Non-Maximum Suppression (NMS) uygulayarak üst üste binen çoklu aynı tespitleri teke düşürelim
+  detections.sort((a, b) => (b['finalConfidence'] as double).compareTo(a['finalConfidence'] as double));
+  final List<Map<String, dynamic>> nmsDetections = [];
+
+  for (var det in detections) {
+    bool keep = true;
+    for (var nmsDet in nmsDetections) {
+      if (det['detectedClass'] != nmsDet['detectedClass']) continue;
+
+      double x1 = math.max(det['x'] - det['w'] / 2, nmsDet['x'] - nmsDet['w'] / 2);
+      double y1 = math.max(det['y'] - det['h'] / 2, nmsDet['y'] - nmsDet['h'] / 2);
+      double x2 = math.min(det['x'] + det['w'] / 2, nmsDet['x'] + nmsDet['w'] / 2);
+      double y2 = math.min(det['y'] + det['h'] / 2, nmsDet['y'] + nmsDet['h'] / 2);
+
+      double interArea = math.max(0, x2 - x1) * math.max(0, y2 - y1);
+      if (interArea > 0) {
+        double area1 = det['w'] * det['h'];
+        double area2 = nmsDet['w'] * nmsDet['h'];
+        double iou = interArea / (area1 + area2 - interArea);
+
+        if (iou > 0.45) { // Aynı sınıf için %45'den fazla örtüşme varsa, küçük olanı ele
+          keep = false;
+          break;
+        }
+      }
+    }
+    if (keep) {
+      nmsDetections.add(det);
+    }
+  }
+
   inputOrt.release();
   runOptions.release();
   for (final o in outputs) {
@@ -299,7 +366,7 @@ Map<String, dynamic>? _runInference(
 
   // JPEG: en az 1 tespit varsa oluştur
   Uint8List? jpegBytes;
-  if (detections.isNotEmpty) {
+  if (nmsDetections.isNotEmpty) {
     try {
       final rgbImage = img.Image(width: 640, height: 640);
 
@@ -324,7 +391,7 @@ Map<String, dynamic>? _runInference(
   }
 
   return {
-    'detections': detections,
+    'detections': nmsDetections,
     'jpegBytes': jpegBytes,
     'blurSkipped': false,
   };
@@ -355,7 +422,7 @@ class OpenCamState extends State<OpenCam> with WidgetsBindingObserver {
 
   Position? currentPosition;
   StreamSubscription<Position>? positionStream;
-  double currentSpeedKmh = 0.0;
+  double currentSpeedKmh = 50.0; // GPS yokken test modu: 50 km/h
   String locationStatus = 'Searching location...';
 
   double _minAvailableZoom = 1.0;
@@ -382,10 +449,10 @@ class OpenCamState extends State<OpenCam> with WidgetsBindingObserver {
 
   final _IsolateWorker _worker = _IsolateWorker();
   bool _workerReady = false;
-  bool _isEncodingBump = false;
 
   int _blurSkippedCount = 0;
   int _totalFrameCount = 0;
+  int _framesWithoutDetection = 0; // Görüntü kayması / hareket bulanıklığına karşı tolerans
 
   @override
   void initState() {
@@ -514,89 +581,95 @@ CREATE TABLE session_vibrations(
       if (DateTime.now().difference(last).inMilliseconds < 1000) return;
     }
 
+    // O anki kamera karesini ve konumu hemen dondur
+    final CameraImage? frozenFrame = imgCamera;
     final double? lat = currentPosition?.latitude;
     final double? lng = currentPosition?.longitude;
+    final String timestamp = DateTime.now().toIso8601String();
 
-    if (_sessionDatabase != null) {
-      await _sessionDatabase!.insert('session_vibrations', {
-        'timestamp': DateTime.now().toIso8601String(),
-        'latitude': lat,
-        'longitude': lng,
-        'magnitude': magnitude,
-      });
+    // UI'ı hemen güncelle — encode bekleme
+    final locLine = lat != null
+        ? '${lat.toStringAsFixed(5)}, ${lng!.toStringAsFixed(5)}'
+        : 'GPS bekleniyor...';
 
-      String? savedImagePath;
+    // Test modunda hız sabit 50 km/h, GPS varsa gerçek hız
+    final double displaySpeed = currentPosition != null ? currentSpeedKmh : 50.0;
 
-      if (imgCamera != null && !_isEncodingBump) {
-        _isEncodingBump = true;
-        try {
-          final planes = imgCamera!.planes;
-          final currentJpegBytes = await compute(encodeBumpFrameTask, {
-            'width': imgCamera!.width,
-            'height': imgCamera!.height,
-            'yBytes': planes[0].bytes,
-            'uBytes': planes[1].bytes,
-            'vBytes': planes[2].bytes,
-            'yRowStride': planes[0].bytesPerRow,
-            'uvRowStride': planes[1].bytesPerRow,
-            'uvPixelStride': planes[1].bytesPerPixel ?? 1,
-          });
+    setState(() {
+      result =
+          'BUMP DETECTED\nMagnitude: ${magnitude.toStringAsFixed(1)}\nLocation: $locLine\nSpeed: ${displaySpeed.toStringAsFixed(1)} km/h';
+      activeBoxes = [];
+    });
 
-          if (currentJpegBytes != null) {
-            final dbPath = await getDatabasesPath();
-            final imgDir = Directory(p.join(dbPath, 'defect_images'));
-            if (!await imgDir.exists()) await imgDir.create(recursive: true);
-            final imgFile = File(p.join(imgDir.path, 'bump_sensor_${DateTime.now().millisecondsSinceEpoch}.jpg'));
-            await imgFile.writeAsBytes(currentJpegBytes);
-            savedImagePath = imgFile.path;
-          }
-        } catch (e) {
-          print('Bump Isolate Görüntü kayıt hatası: $e');
-        }
-        _isEncodingBump = false;
+    _bumpWarningTimer?.cancel();
+    _bumpWarningTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted && result.startsWith('BUMP DETECTED')) {
+        setState(() => result = '');
       }
+    });
 
-      await _sessionDatabase!.insert('session_detections', {
-        'timestamp': DateTime.now().toIso8601String(),
-        'defectType': 'Bump (Sensor)',
-        'confidence': 1.0,
-        'latitude': lat,
-        'longitude': lng,
-        'speedKmh': currentSpeedKmh,
-        'distanceToDefect': 0.0,
-        'isSensorConfirmed': 1,
-        'imagePath': savedImagePath,
-      });
-    }
-
+    // bumpBuffer'a ekle
     bumpBuffer.add({
       'time': DateTime.now(),
       'latitude': lat ?? 0.0,
       'longitude': lng ?? 0.0,
       'magnitude': magnitude,
     });
+    if (bumpBuffer.length > 20) bumpBuffer.removeAt(0);
 
-    if (bumpBuffer.length > 20) {
-      bumpBuffer.removeAt(0);
-    }
+    if (_sessionDatabase == null) return;
 
-    final locLine = lat != null
-        ? 'Vehicle: ${lat.toStringAsFixed(5)}, ${lng!.toStringAsFixed(5)}'
-        : 'Vehicle Location: No GPS signal';
-
-    setState(() {
-      result =
-          '⚠️ BUMP DETECTED (Sensor)!\nMagnitude: ${magnitude.toStringAsFixed(1)}\n$locLine\nSpeed: ${currentSpeedKmh.toStringAsFixed(1)} km/h';
-      activeBoxes = [];
+    // Vibration kaydı
+    await _sessionDatabase!.insert('session_vibrations', {
+      'timestamp': timestamp,
+      'latitude': lat,
+      'longitude': lng,
+      'magnitude': magnitude,
     });
 
-    _bumpWarningTimer?.cancel();
-    _bumpWarningTimer = Timer(const Duration(seconds: 3), () {
-      if (mounted && result.startsWith('⚠️')) {
-        setState(() {
-          result = '';
+    // Görüntüyü encode et — her bump kendi encode işini ayrı başlatır, _isEncodingBump guard kaldırıldı
+    String? savedImagePath;
+    if (frozenFrame != null) {
+      try {
+        final planes = frozenFrame.planes;
+        final currentJpegBytes = await compute(encodeBumpFrameTask, {
+          'width': frozenFrame.width,
+          'height': frozenFrame.height,
+          'yBytes': planes[0].bytes,
+          'uBytes': planes[1].bytes,
+          'vBytes': planes[2].bytes,
+          'yRowStride': planes[0].bytesPerRow,
+          'uvRowStride': planes[1].bytesPerRow,
+          'uvPixelStride': planes[1].bytesPerPixel ?? 1,
         });
+
+        if (currentJpegBytes != null) {
+          final dbPath = await getDatabasesPath();
+          final imgDir = Directory(p.join(dbPath, 'defect_images'));
+          if (!await imgDir.exists()) await imgDir.create(recursive: true);
+          final imgFile = File(p.join(
+            imgDir.path,
+            'bump_sensor_${DateTime.now().millisecondsSinceEpoch}.jpg',
+          ));
+          await imgFile.writeAsBytes(currentJpegBytes);
+          savedImagePath = imgFile.path;
+        }
+      } catch (e) {
+        print('Bump görüntü kayıt hatası: $e');
       }
+    }
+
+    // Detection kaydı — görüntü hazır olduktan sonra
+    await _sessionDatabase!.insert('session_detections', {
+      'timestamp': timestamp,
+      'defectType': 'Bump (Sensor)',
+      'confidence': 1.0,
+      'latitude': lat,
+      'longitude': lng,
+      'speedKmh': currentSpeedKmh,
+      'distanceToDefect': 0.0,
+      'isSensorConfirmed': 1,
+      'imagePath': savedImagePath,
     });
   }
 
@@ -620,15 +693,39 @@ CREATE TABLE session_vibrations(
 
     setState(() => locationStatus = 'Locating...');
 
+    // İlk konumu hızlıca al
     try {
       currentPosition = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.bestForNavigation,
       );
-    } catch (_) {}
+      setState(() => locationStatus = 'GPS Active');
+    } catch (e) {
+      print('İlk konum alınamadı: $e');
+    }
 
-    setState(() {
-      currentSpeedKmh = 50.0;
-      locationStatus = 'TEST MODE (50 km/h)';
+    // Sürekli güncelle — lat/lng 0.0 sorununu bu çözer
+    positionStream = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 0,
+      ),
+    ).listen((pos) {
+      if (!mounted) return;
+      setState(() {
+        currentPosition = pos;
+        final raw = pos.speed * 3.6;
+        currentSpeedKmh = raw < 2.0 ? 0.0 : raw;
+        locationStatus = 'GPS Active';
+      });
+    }, onError: (e) {
+      print('GPS stream hatası: $e');
+      // GPS gelmezse test moduna düş
+      if (currentPosition == null) {
+        setState(() {
+          currentSpeedKmh = 50.0;
+          locationStatus = 'TEST MODE (50 km/h)';
+        });
+      }
     });
   }
 
@@ -687,6 +784,8 @@ CREATE TABLE session_vibrations(
       }
 
       if (detections.isNotEmpty) {
+        _framesWithoutDetection = 0; // Tespit edildi, sayacı sıfırla
+
         // DB ve konum hesabı için en yüksek confidence'lı tespiti kullan
         final best = detections.reduce((a, b) =>
             (a['finalConfidence'] as double) > (b['finalConfidence'] as double)
@@ -782,8 +881,8 @@ CREATE TABLE session_vibrations(
             ? 'Vehicle: ${currentPosition!.latitude.toStringAsFixed(5)}, ${currentPosition!.longitude.toStringAsFixed(5)}\n'
                 'Speed: ${currentSpeedKmh.toStringAsFixed(1)} km/h\n'
                 'Distance: ${distToDefect.toStringAsFixed(1)} m\n\n'
-                '📍 Defect: ${defectLoc.latitude.toStringAsFixed(5)}, ${defectLoc.longitude.toStringAsFixed(5)}'
-            : '⚠️ No GPS — Test mode active';
+                'Defect: ${defectLoc.latitude.toStringAsFixed(5)}, ${defectLoc.longitude.toStringAsFixed(5)}'
+            : 'No GPS — Test mode active';
 
         // Tüm box'ları UI için hazırla
         final List<Map<String, dynamic>> boxes = detections.map((d) {
@@ -804,15 +903,27 @@ CREATE TABLE session_vibrations(
         }).toList();
 
         setState(() {
-          result =
-              '🚧 $detClass\nConfidence: ${(finalConf * 100).toStringAsFixed(1)}%\n\n$posText';
+          // Bump mesajı aktifse result metnini ezme, sadece box'ları güncelle
+          if (!result.startsWith('BUMP DETECTED')) {
+            result =
+                '$detClass\nConfidence: ${(finalConf * 100).toStringAsFixed(1)}%\n\n$posText';
+          }
           activeBoxes = boxes;
         });
       } else {
-        setState(() {
-          result = '';
-          activeBoxes = [];
-        });
+        _framesWithoutDetection++;
+
+        // Hızla hareket ederken veya görüntü titrerken 1-2 frame model kaçırabilir.
+        // Tolerans (örn. 5 frame) aşılana kadar kutuları silmiyoruz. (Flickering engellemek için)
+        if (_framesWithoutDetection > 5) {
+          // Bump mesajı aktifse (⚠️ ile başlıyorsa) ezme — sadece model detectionı temizle
+          setState(() {
+            if (!result.startsWith('BUMP DETECTED')) {
+              result = '';
+            }
+            activeBoxes = [];
+          });
+        }
       }
     } catch (e) {
       print('Frame işleme hatası: $e');
@@ -1344,3 +1455,6 @@ CREATE TABLE session_vibrations(
     });
   }
 }
+
+
+
